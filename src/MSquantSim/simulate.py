@@ -12,6 +12,8 @@ from sdv.single_table import TVAESynthesizer
 from sdv.metadata import SingleTableMetadata
 
 from copulas.multivariate import GaussianMultivariate, VineCopula
+from copulas.utils import EPSILON
+from scipy import stats
 
 import warnings
 warnings.filterwarnings('ignore')
@@ -26,9 +28,63 @@ def copula_model(data, samples):
     
     return synthetic_samples
 
+def fit_copula(data, independent=False):
+    """
+    Fit a Gaussian copula once, for repeated draws with sample_copula.
+
+    independent : if True, replace the fitted correlation with the identity, so
+                  proteins are independent but keep the fitted marginals
+                  (ablation of the correlation structure).
+    """
+    model = GaussianMultivariate()
+    model.fit(data)
+    if independent:
+        identity = np.eye(len(model.columns))
+        if isinstance(model.correlation, pd.DataFrame):
+            identity = pd.DataFrame(identity, index=model.correlation.index,
+                                    columns=model.correlation.columns)
+        model.correlation = identity
+    return model
+
+def sample_copula(model, samples, random_state=None):
+    """
+    Draw `samples` rows from a copula fitted with fit_copula.
+
+    Same draws as model.sample, except that a marginal value of +-inf is
+    recomputed just inside the solver's limit, so every value is finite.
+    copulas' GaussianKDE.percent_point returns +-inf when the normal draw maps
+    to within float32 eps of 0 or 1 (|z| > ~5.2).
+    """
+    # copulas samples through numpy's global RNG
+    if random_state is not None:
+        np.random.seed(random_state)
+    model.check_fit()
+    normal = model._get_normal_samples(samples, None)
+    output = {}
+    for column, univariate in zip(model.columns, model.univariates):
+        u = stats.norm.cdf(normal[column])
+        values = np.asarray(univariate.percent_point(u), dtype=float)
+        bad = ~np.isfinite(values)
+        if bad.any():
+            values[bad] = univariate.percent_point(np.clip(u[bad], 2 * EPSILON, 1 - 2 * EPSILON))
+        output[column] = values
+    return pd.DataFrame(output)
+
+def fit_per_protein(data):
+    """Per-protein Normal marginals (means, variances) for sample_per_protein."""
+    return data.mean(), data.var()
+
+def sample_per_protein(params, samples, rng=None):
+    """Draw `samples` rows of independent Normal proteins from fit_per_protein output."""
+    means, variances = params
+    rng = np.random.default_rng() if rng is None else rng
+    values = rng.normal(means.to_numpy(), np.sqrt(variances.to_numpy()),
+                        size=(samples, len(means)))
+    return pd.DataFrame(values, columns=means.index)
+
 def tvae_model(data, metadata, samples):
     # Create and fit the TVAE model
-    model = TVAESynthesizer(metadata)
+    model = TVAESynthesizer(metadata, enable_gpu=False)
     model.fit(data)
     
     # Sample from the model
@@ -50,7 +106,7 @@ def per_protein_model(data, means, variances, samples):
 
 def simulate_using_copula(dataset, num_simulations=1, samples_per_simulation=None,
                           output_dir=None, output_prefix='simulated',
-                          return_data=True, random_state=None):
+                          return_data=True, random_state=None, n_jobs=-2):
     """
     Simulate protein abundance data using Gaussian Copula models.
 
@@ -71,6 +127,9 @@ def simulate_using_copula(dataset, num_simulations=1, samples_per_simulation=Non
         Whether to return the simulated data
     random_state : int, default None
         Random seed for reproducibility
+    n_jobs : int, default -2
+        Number of parallel workers used across simulations when num_simulations > 1.
+        -1 uses every core, -2 leaves one free, 1 disables parallelism.
 
     Returns:
     --------
@@ -90,7 +149,7 @@ def simulate_using_copula(dataset, num_simulations=1, samples_per_simulation=Non
     if num_simulations == 1:
         simulation = copula_model(dataset, samples_per_simulation)
     else:
-        simulation = Parallel(n_jobs=-2)(
+        simulation = Parallel(n_jobs=n_jobs)(
             delayed(copula_model)(dataset, samples_per_simulation)
             for _ in tqdm(range(num_simulations), 
                           desc="Running copula simulations"))
@@ -113,8 +172,8 @@ def simulate_using_copula(dataset, num_simulations=1, samples_per_simulation=Non
   
 def simulate_using_tvae(dataset, metadata=None, num_simulations=1,
                         samples_per_simulation=None,
-                          output_dir=None, output_prefix='simulated',
-                          return_data=True, random_state=None):
+                        output_dir=None, output_prefix='simulated',
+                        return_data=True, random_state=None, n_jobs=-2):
     """
     Generate synthetic data using TVAE synthesizer and save to CSV files.
 
@@ -137,6 +196,9 @@ def simulate_using_tvae(dataset, metadata=None, num_simulations=1,
         Whether to return the simulated data
     random_state : int, default None
         Random seed for reproducibility
+    n_jobs : int, default -2
+        Number of parallel workers used across simulations when num_simulations > 1.
+        -1 uses every core, -2 leaves one free, 1 disables parallelism.
 
     Returns:
     --------
@@ -160,7 +222,7 @@ def simulate_using_tvae(dataset, metadata=None, num_simulations=1,
     if num_simulations == 1:
         simulation = tvae_model(dataset, metadata, samples_per_simulation)
     else:
-        simulation = Parallel(n_jobs=-2)(
+        simulation = Parallel(n_jobs=n_jobs)(
             delayed(tvae_model)(dataset, metadata, samples_per_simulation)
             for _ in tqdm(range(num_simulations), 
                           desc="Running tvae simulations"))
@@ -184,7 +246,7 @@ def simulate_using_tvae(dataset, metadata=None, num_simulations=1,
 def simulate_using_per_protein(dataset, num_simulations=1,
                                samples_per_simulation=None,
                                output_dir=None, output_prefix='simulated',
-                               return_data=True, random_state=None):
+                               return_data=True, random_state=None, n_jobs=-2):
     """
     Simulate synthetic data using per-protein Gaussian distributions.
 
@@ -208,6 +270,9 @@ def simulate_using_per_protein(dataset, num_simulations=1,
         Whether to return the simulated data
     random_state : int, default None
         Random seed for reproducibility
+    n_jobs : int, default -2
+        Number of parallel workers used across simulations when num_simulations > 1.
+        -1 uses every core, -2 leaves one free, 1 disables parallelism.
 
     Returns:
     --------
@@ -231,7 +296,7 @@ def simulate_using_per_protein(dataset, num_simulations=1,
     if num_simulations == 1:
         simulation = per_protein_model(dataset, means, variances, samples_per_simulation)
     else:
-        simulation = Parallel(n_jobs=-2)(
+        simulation = Parallel(n_jobs=n_jobs)(
             delayed(per_protein_model)(dataset, means, variances, samples_per_simulation)
             for _ in tqdm(range(num_simulations), 
                           desc="Running per-protein simulations"))

@@ -1,62 +1,119 @@
 import pandas as pd
+from sklearn.impute import KNNImputer
+from sklearn.pipeline import Pipeline
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import StratifiedKFold, train_test_split, RandomizedSearchCV
 from sklearn.metrics import accuracy_score, classification_report
 import numpy as np
 
+from sklearn.decomposition import PCA
+
 from joblib import Parallel, delayed
 from tqdm import tqdm
 from tqdm_joblib import tqdm_joblib
 
-def train_rf(X, y):
-
-    # Split the data into training and testing sets
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42)
+def train_rf(X, y, validation_data):
 
     param_grid = {
-        "n_estimators": [200, 500, 1000],
-        "max_depth": [None, 10, 20, 40],
-        "min_samples_split": [2, 5, 10],
-        "min_samples_leaf": [1, 2, 4, 8],
-        "max_features": ["sqrt", "log2", 0.5],
-        "class_weight": [None, "balanced"]
+        "rf__n_estimators": [200, 500, 1000],
+        "rf__max_depth": [None, 10, 20, 40],
+        "rf__min_samples_split": [2, 5, 10],
+        "rf__min_samples_leaf": [1, 2, 4, 8],
+        "rf__max_features": ["sqrt", "log2", 0.5],
+        "rf__class_weight": [None, "balanced"],
+        # Optional: tune imputer too
+        # "imputer__n_neighbors": [3, 5, 7, 11],
+        # "imputer__weights": ["uniform", "distance"],
     }
     
     cv = StratifiedKFold(n_splits=4, shuffle=True, random_state=42)
 
+    pipe = Pipeline(
+        steps=[
+            ("imputer", KNNImputer(n_neighbors=5, weights="distance")),
+            ("rf", RandomForestClassifier(random_state=42)),
+        ]
+    )
+
     search = RandomizedSearchCV(
-        RandomForestClassifier(),
+        estimator=pipe,
         param_distributions=param_grid,
         cv=cv,
         n_iter=30,
         scoring="accuracy",
-        n_jobs=-1
+        n_jobs=-1,
+        error_score="raise",
+        verbose=0,
+        random_state=42,
     )
 
-    search.fit(X_train, y_train)
+
+    search.fit(X, y)
     best_model = search.best_estimator_
     
-    y_pred = best_model.predict(X_test)
-    accuracy = accuracy_score(y_test, y_pred)
-        
+    validation_X = validation_data[X.columns]
+    validation_y = validation_data[y.name]
+    y_pred = best_model.predict(validation_X)
+    accuracy = accuracy_score(validation_y, y_pred)
+    
     return accuracy
 
-def run_random_forest(data, y_label, n_runs=100):
+def get_pca_explained_variance(data, n_components=2, standardize=True):
+    """
+    Run PCA on a DataFrame and return the explained variance by each component.
     
-    # Assume 'condition' is the target variable column in your CSV
-    X = data.drop(y_label, axis=1)
-    y = data[y_label]
+    Parameters:
+    -----------
+    data : pandas DataFrame
+        DataFrame containing numerical data for PCA analysis
+    n_components : int, default 2
+        Number of principal components to compute
+    standardize : bool, default True
+        Whether to standardize the data before PCA
+
+    Returns:
+    --------
+    dict
+        Dictionary containing:
+        - 'explained_variance_ratio': array of explained variance ratio for each component
+        - 'cumulative_variance': cumulative explained variance
+        - 'total_variance': total variance explained by all components
+        - 'variance_by_component': dict mapping component number to variance percentage
+    """
+
     
-    with tqdm_joblib(tqdm(total=n_runs, 
-                              desc="Running simulations")):
-            model_accuracy_list = Parallel(n_jobs=-2)(
-                delayed(train_rf)(X, y)
-                for _ in range(n_runs)
-            )
-
-    return model_accuracy_list
-
+    # Handle missing values
+    if data.isna().any().any():
+        imputer = KNNImputer(n_neighbors=5, weights="distance")
+        processed_data = pd.DataFrame(
+            imputer.fit_transform(data),
+            columns=data.columns
+        )
+    else:
+        processed_data = data
+    
+    # Standardize if requested
+    if standardize:
+        processed_data = (processed_data - processed_data.mean()) / processed_data.std()
+    
+    # Apply PCA
+    pca = PCA(n_components=min(n_components, processed_data.shape[1]))
+    pca.fit(processed_data)
+    
+    # Prepare results
+    cumulative_variance = np.cumsum(pca.explained_variance_ratio_) * 100
+    variance_by_component = {
+        f"PC{i+1}": var * 100 
+        for i, var in enumerate(pca.explained_variance_ratio_)
+    }
+    
+    return {
+        'explained_variance_ratio': pca.explained_variance_ratio_ * 100,
+        'cumulative_variance': cumulative_variance,
+        'total_variance': np.sum(pca.explained_variance_ratio_) * 100,
+        'variance_by_component': variance_by_component,
+        'pca_model': pca
+    }
 
 def identify_significant_proteins(data, condition_col='Condition', significance_level=0.05, print_results=True,
                                   require_all_significant=False):
@@ -145,6 +202,144 @@ def identify_significant_proteins(data, condition_col='Condition', significance_
         print(not_significant_proteins)
 
     return significant_proteins, not_significant_proteins, t_test_results
+
+
+def _bh_adjust(p_values):
+    """Benjamini-Hochberg FDR adjustment. NaN p-values are ignored and stay NaN."""
+    import numpy as np
+
+    p = np.asarray(p_values, dtype=float)
+    adjusted = np.full(p.shape, np.nan)
+
+    observed = ~np.isnan(p)
+    m = int(observed.sum())
+    if m == 0:
+        return adjusted
+
+    p_obs = p[observed]
+    order = np.argsort(p_obs)
+    ranked = p_obs[order] * m / np.arange(1, m + 1)
+
+    # Enforce monotonicity from the largest p-value down, then cap at 1
+    ranked = np.minimum.accumulate(ranked[::-1])[::-1]
+    ranked = np.clip(ranked, 0., 1.)
+
+    unsorted = np.empty(m, dtype=float)
+    unsorted[order] = ranked
+    adjusted[observed] = unsorted
+
+    return adjusted
+
+
+def run_ttest(data, condition_col='Condition', equal_var=False,
+              adjust_pvalues=True, significance_level=0.05, min_samples=2,
+              sort_by_pvalue=True):
+    """
+    Run two-sample t-tests between the two conditions present in a DataFrame.
+
+    Parameters:
+    -----------
+    data : pandas DataFrame
+        DataFrame with one protein per column plus a single column holding the
+        condition label. Every column other than `condition_col` is tested, and
+        `condition_col` must contain exactly two distinct values.
+    condition_col : str, default 'Condition'
+        Name of the column containing condition labels.
+    equal_var : bool, default False
+        If False (default) run Welch's t-test, which does not assume equal
+        variances. If True, run the standard pooled-variance t-test.
+    adjust_pvalues : bool, default True
+        If True, add a Benjamini-Hochberg adjusted p-value column and use it to
+        call significance. If False, significance is called on the raw p-value.
+    significance_level : float, default 0.05
+        Threshold used for the `significant` column.
+    min_samples : int, default 2
+        Minimum number of non-missing observations required in each group. Proteins
+        below this in either group get NaN statistics and are excluded from the
+        BH adjustment.
+    sort_by_pvalue : bool, default True
+        Whether to sort the returned table by ascending p-value.
+
+    Returns:
+    --------
+    pandas DataFrame
+        One row per protein with columns:
+        - 'Protein'
+        - 'n_<cond1>', 'n_<cond2>' : non-missing sample counts
+        - 'mean_<cond1>', 'mean_<cond2>', 'sd_<cond1>', 'sd_<cond2>'
+        - 'diff' : mean(cond2) - mean(cond1) (a log2 fold change for log2 input)
+        - 'statistic', 'pvalue'
+        - 'adj_pvalue' : BH adjusted p-value (only if adjust_pvalues=True)
+        - 'significant' : bool
+    """
+    import pandas as pd
+    import numpy as np
+    from scipy.stats import ttest_ind
+
+    if condition_col not in data.columns:
+        raise ValueError(f"Condition column '{condition_col}' not found in data")
+
+    conditions = pd.Series(data[condition_col].dropna().unique()).sort_values().tolist()
+    if len(conditions) != 2:
+        raise ValueError(
+            f"Expected exactly 2 distinct values in '{condition_col}', found "
+            f"{len(conditions)}: {conditions}"
+        )
+    cond1, cond2 = conditions
+
+    # Every column other than the condition column is a protein
+    protein_cols = [col for col in data.columns if col != condition_col]
+    if len(protein_cols) == 0:
+        raise ValueError("No protein columns available to test")
+
+    non_numeric = [
+        col for col in protein_cols
+        if not pd.api.types.is_numeric_dtype(data[col])
+    ]
+    if len(non_numeric) > 0:
+        raise ValueError(
+            f"Expected all columns other than '{condition_col}' to be numeric "
+            f"protein abundances, but found non-numeric columns: {non_numeric}"
+        )
+
+    group1 = data.loc[data[condition_col] == cond1, protein_cols]
+    group2 = data.loc[data[condition_col] == cond2, protein_cols]
+
+    rows = list()
+    for protein in protein_cols:
+        x1 = group1[protein].dropna().values
+        x2 = group2[protein].dropna().values
+
+        if len(x1) >= min_samples and len(x2) >= min_samples:
+            statistic, p_value = ttest_ind(x2, x1, equal_var=equal_var)
+        else:
+            statistic, p_value = np.nan, np.nan
+
+        rows.append({
+            "Protein": protein,
+            f"n_{cond1}": len(x1),
+            f"n_{cond2}": len(x2),
+            f"mean_{cond1}": np.mean(x1) if len(x1) > 0 else np.nan,
+            f"mean_{cond2}": np.mean(x2) if len(x2) > 0 else np.nan,
+            f"sd_{cond1}": np.std(x1, ddof=1) if len(x1) > 1 else np.nan,
+            f"sd_{cond2}": np.std(x2, ddof=1) if len(x2) > 1 else np.nan,
+            "diff": (np.mean(x2) - np.mean(x1)) if (len(x1) > 0 and len(x2) > 0) else np.nan,
+            "statistic": statistic,
+            "pvalue": p_value,
+        })
+
+    results = pd.DataFrame(rows)
+
+    if adjust_pvalues:
+        results["adj_pvalue"] = _bh_adjust(results["pvalue"].values)
+        results["significant"] = results["adj_pvalue"] < significance_level
+    else:
+        results["significant"] = results["pvalue"] < significance_level
+
+    if sort_by_pvalue:
+        results = results.sort_values("pvalue", na_position="last").reset_index(drop=True)
+
+    return results
 
 
 def calculate_percentage_of_variation(data, size, n_iterations=100, n_components=2,

@@ -1,0 +1,120 @@
+# paper.mplstyle - shared matplotlib style for every figure in
+# "Simulated mass spectrometry-based protein abundances enable effective experimental design".
+#
+# Implements the Journal of Proteome Research (ACS) graphics specs recorded in
+# CLAUDE.md > "Figure specifications" (source: references/JPR_author_guidelines_2026-10-05.pdf,
+# Appendix 2 "Preparing Graphics").
+#
+# Draw every figure at its FINAL published size so the sizes below are the printed sizes:
+#   single column : width <= 3.33 in (240 pt)
+#   double column : 4.167 in <= width <= 7.0 in (300-504 pt)
+#   max depth     : 9.167 in (660 pt) INCLUDING the caption; reserve 12 pt per caption line
+#
+# Usage:  plt.style.use("<path>/figures/paper.mplstyle")
+# Simulator colors/markers/line styles are fixed per simulator (see CLAUDE.md); the
+# prop_cycle below lists them in canonical order, but plotting code should look them
+# up by simulator name rather than rely on cycle position.
+
+## ---------------------------------------------------------------- Figure & export
+figure.figsize                : 7.0, 3.0    # double-column default (in)
+figure.dpi                    : 150         # on-screen preview only
+figure.facecolor              : white
+figure.constrained_layout.use : True
+savefig.format                : pdf         # vector; pdfLaTeX includes it directly
+savefig.dpi                   : 600         # raster exports + rasterized artists (JPR min: 300 color, 600 grayscale)
+savefig.bbox                  : standard    # keep the designed width ('tight' would change the printed size)
+savefig.facecolor             : white
+savefig.transparent           : False
+pdf.fonttype                  : 42          # embed TrueType fonts; text stays editable text
+ps.fonttype                   : 42
+svg.fonttype                  : none
+
+## ---------------------------------------------------------------- Fonts
+# JPR: lettering >= 4.5 pt at final size; Helvetica or Arial recommended.
+# Smallest text here is 6 pt, so it stays >= 4.5 pt even if a 7 in figure is
+# scaled to the draft's 5.5 in \textwidth (x0.79).
+# Liberation Sans is metric-identical to Arial and is the fallback on Linux.
+font.family          : sans-serif
+font.sans-serif      : Arial, Helvetica, Liberation Sans, DejaVu Sans
+font.size            : 7
+axes.titlesize       : 7
+axes.titleweight     : normal
+axes.labelsize       : 7
+xtick.labelsize      : 6
+ytick.labelsize      : 6
+legend.fontsize      : 6.5
+legend.title_fontsize: 7
+figure.titlesize     : 8
+figure.labelsize     : 7                     # fig.supxlabel / fig.supylabel
+mathtext.default     : regular               # math text uses the same sans font
+axes.unicode_minus   : True
+
+## ---------------------------------------------------------------- Lines & marks
+# JPR: lines no thinner than 0.5 pt. Nothing here is below 0.6 pt.
+lines.linewidth       : 1.25
+lines.markersize      : 3.5
+lines.markeredgewidth : 0.75
+patch.linewidth       : 0.75
+hatch.linewidth       : 0.75
+errorbar.capsize      : 2
+
+boxplot.boxprops.linewidth     : 0.75
+boxplot.whiskerprops.linewidth : 0.75
+boxplot.capprops.linewidth     : 0.75
+boxplot.medianprops.linewidth  : 1.0
+boxplot.medianprops.color      : black
+boxplot.flierprops.markersize  : 2
+boxplot.flierprops.markeredgewidth : 0.6
+
+## ---------------------------------------------------------------- Axes
+axes.linewidth     : 0.75
+axes.edgecolor     : black
+axes.labelcolor    : black
+axes.facecolor     : white
+axes.spines.top    : False
+axes.spines.right  : False
+axes.labelpad      : 2
+axes.titlepad      : 3
+axes.titlelocation : center
+axes.grid          : False
+grid.linewidth     : 0.6
+grid.color         : D9D9D9
+grid.linestyle     : -
+
+# Canonical simulator order: Experimental, Per-protein, Copula, TVAE.
+# Okabe-Ito hues; validated colorblind-safe (all-pairs CVD dE >= 8.6) with >= 3:1
+# contrast on white. Marker + line style give a second, non-color cue (JPR:
+# "avoid relying on color alone").
+axes.prop_cycle : cycler(color=['000000', '009E73', '0072B2', 'D55E00']) + cycler(marker=['o', '^', 's', 'D']) + cycler(linestyle=['-', ':', '-', '--'])
+
+## ---------------------------------------------------------------- Ticks
+xtick.direction     : out
+ytick.direction     : out
+xtick.color         : black
+ytick.color         : black
+xtick.major.size    : 2.5
+ytick.major.size    : 2.5
+xtick.minor.size    : 1.5
+ytick.minor.size    : 1.5
+xtick.major.width   : 0.75
+ytick.major.width   : 0.75
+xtick.minor.width   : 0.6
+ytick.minor.width   : 0.6
+xtick.major.pad     : 2
+ytick.major.pad     : 2
+
+## ---------------------------------------------------------------- Legend
+legend.frameon       : False
+legend.handlelength  : 2.2                   # long enough to show dashed/dotted styles
+legend.handletextpad : 0.4
+legend.columnspacing : 1.0
+legend.borderaxespad : 0.3
+legend.borderpad     : 0.2
+legend.labelspacing  : 0.3
+
+## ---------------------------------------------------------------- Images / heatmaps
+# Correlation heatmaps: diverging blue (-1) -> white (0) -> red (+1), matching the
+# existing captions. Call with vmin=-1, vmax=1 and rasterized=True.
+image.cmap          : RdBu_r
+image.interpolation : nearest
+image.origin        : upper

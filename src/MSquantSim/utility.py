@@ -1,190 +1,165 @@
+import numpy as np
 import pandas as pd
-
-def plot_indra(tsv_file, output_file=None):
-    """A simple placeholder function"""
-    print("plot_indra function called")
-    return None
-
-def read_df(file_path, delimiter=','):
+from scipy.stats import norm
+from scipy.optimize import minimize
+from scipy.special import expit, log_expit
+from numpy.polynomial.hermite_e import hermegauss
+ 
+# Gauss-Hermite nodes for integrating against a standard normal density
+_NODES, _W = hermegauss(40)
+_W = _W / np.sqrt(2 * np.pi)
+ 
+ 
+def _nll_protein(params, x_obs, n_miss, a, b):
+    """Negative log-likelihood for one protein given the detection curve."""
+    mu, log_sigma = params
+    sigma = np.exp(log_sigma)
+    if not np.isfinite(sigma) or sigma <= 0:
+        return 1e12
+ 
+    # observed values: density * P(detected)
+    ll = np.sum(norm.logpdf(x_obs, mu, sigma) + log_expit(a + b * x_obs))
+ 
+    # missing values: integrate density * P(not detected) over the real line
+    if n_miss > 0:
+        t = mu + sigma * _NODES
+        p_miss = np.dot(_W, 1.0 - expit(a + b * t))
+        ll += n_miss * np.log(max(p_miss, 1e-300))
+ 
+    return -ll
+ 
+ 
+def _fit_marginals(block, a, b, min_obs=3, max_missing=0.9):
+    """Fit mu, sigma for every protein in one group, holding (a, b) fixed."""
+    rows = {}
+    n_runs = len(block)
+    for prot in block.columns:
+        col = block[prot]
+        x = col.dropna().to_numpy(dtype=float)
+        n_miss = int(col.isna().sum())
+        if len(x) < min_obs or n_miss / n_runs > max_missing:
+            continue
+        start = [x.mean(), np.log(x.std(ddof=1) + 1e-6)]
+        res = minimize(_nll_protein, start, args=(x, n_miss, a, b),
+                       method="Nelder-Mead",
+                       options={"xatol": 1e-6, "fatol": 1e-8, "maxiter": 2000})
+        mu, log_sigma = res.x
+        rows[prot] = (mu, np.exp(log_sigma))
+    return pd.DataFrame(rows, index=["mu", "sigma"]).T
+ 
+ 
+def _fit_detection(blocks, fits, a0, b0):
+    """Optimize the shared detection curve with all marginals held fixed."""
+    # pre-extract so the objective is cheap
+    cache = []
+    for block, fit in zip(blocks, fits):
+        for prot in fit.index:
+            col = block[prot]
+            cache.append((col.dropna().to_numpy(dtype=float),
+                          int(col.isna().sum()),
+                          fit.at[prot, "mu"],
+                          np.log(fit.at[prot, "sigma"])))
+ 
+    def objective(ab):
+        a, b = ab
+        if b <= 1e-6:
+            return 1e12
+        return sum(_nll_protein([mu, ls], x, nm, a, b)
+                   for x, nm, mu, ls in cache)
+ 
+    res = minimize(objective, [a0, b0], method="Nelder-Mead",
+                   options={"xatol": 1e-5, "fatol": 1e-6, "maxiter": 500})
+    return res.x
+ 
+ 
+def fit_mnar(df, group_col="Condition", n_outer=8, tol=1e-4, verbose=True):
     """
-    Reads a CSV file into a DataFrame.
-
-    Parameters:
-    - file_path (str): Path to the CSV file.
-    - delimiter (str): Delimiter used in the CSV file. Default is ','.
-
-    Returns:
-    - pd.DataFrame: DataFrame containing the CSV data.
-
-    Raises:
-    - FileNotFoundError: If the file is not found at the specified path.
-    - pd.errors.EmptyDataError: If the file is empty.
-    - pd.errors.ParserError: If there is a parsing error (e.g., incorrect delimiter).
+    df       : runs x proteins DataFrame, plus one grouping column
+    returns  : (dict of {group: DataFrame[mu, sigma]}, (a, b))
     """
-    try:
-        df = pd.read_csv(file_path, delimiter=delimiter)
-        print(f"DataFrame loaded successfully from {file_path}")
-        return df
-    except FileNotFoundError:
-        print(f"Error: The file at {file_path} was not found.")
-        raise
-    except pd.errors.EmptyDataError:
-        print(f"Error: The file at {file_path} is empty.")
-        raise
-    except pd.errors.ParserError:
-        print(f"Error: Parsing error encountered. Check the delimiter and file format.")
-        raise
-    except Exception as e:
-        print(f"An unexpected error occurred: {e}")
-        raise
-    return
+    groups = list(df[group_col].unique())
+    blocks = [df.loc[df[group_col] == g].drop(columns=group_col).astype(float)
+              for g in groups]
+ 
+    vals = df.drop(columns=group_col).to_numpy(dtype=float)
+    a, b = -np.nanmedian(vals), 1.0  # 50% detection near the middle of the range
+ 
+    for it in range(n_outer):
+        fits = [_fit_marginals(bl, a, b) for bl in blocks]
+        a_new, b_new = _fit_detection(blocks, fits, a, b)
+        shift = max(abs(a_new - a), abs(b_new - b))
+        a, b = a_new, b_new
+        if verbose:
+            print(f"iter {it}: a={a:.4f}  b={b:.4f}  delta={shift:.2e}")
+        if shift < tol:
+            break
+ 
+    fits = [_fit_marginals(bl, a, b) for bl in blocks]
+    return dict(zip(groups, fits)), (a, b)
 
 
-def show_protein_abundance_features(file_path):
+def calibrate_offsets(df, a, b, target_rate, group_col="Condition", tol=1e-4):
     """
-    Reads a protein abundance matrix from a CSV file and displays its features.
+    Intercept shift that makes the expected missing-value rate of complete data
+    equal `target_rate` under the detection curve (a, b).
 
-    Parameters:
-    - file_path (str): Path to the protein abundance CSV file.
-
-    Returns:
-    - data (pd.DataFrame): The DataFrame containing the protein abundance data.
+    df          : complete runs x proteins DataFrame, plus grouping column
+    a, b        : detection curve from fit_mnar
+    target_rate : desired overall fraction of missing values, in [0, 1)
+    returns     : {protein: shift}, the same shift for every protein, in the
+                  format apply_dropout expects
     """
-    # Read the protein abundance matrix
-    data = pd.read_csv(file_path)
+    prots = [c for c in df.columns if c != group_col]
+    X = df[prots].to_numpy(dtype=float)
+    if target_rate <= 0:
+        return {p: np.inf for p in prots}
 
-    # Display the first few rows
-    print("First few rows of the protein abundance matrix:")
-    print(data.head())
+    def expected_rate(shift):
+        return np.mean(1.0 - expit(a + shift + b * X))
 
-    # Display summary statistics
-    print("\nSummary statistics:")
-    print(data.describe())
-
-    # Display column names and data types
-    print("\nColumn names and data types:")
-    print(data.info())
-
-    return
-
-
-def add_missing_values(data, mar_param=0.0, mnar_params=(-3, 0.4)):
-    # data['Intensity'] = np.log2(data['Intensity'])  # Optional log transformation
-
-    data['True_Intensity'] = data['Intensity'].copy()
-
-    for i in range(len(data)):
-        mar_prob = np.random.uniform()
-        mnar_prob = np.random.uniform()
-
-        if pd.isna(data.loc[i, 'Intensity']):
-            mnar_thresh = 0
+    # expected_rate decreases monotonically in the shift: bisect on a wide bracket
+    lo, hi = -100.0, 100.0
+    while hi - lo > tol:
+        mid = (lo + hi) / 2
+        if expected_rate(mid) > target_rate:
+            lo = mid
         else:
-            mnar_thresh = 1 / (1 + np.exp(mnar_params[0] + mnar_params[1] * data.loc[i, 'Intensity']))
+            hi = mid
+    shift = (lo + hi) / 2
+    return {p: shift for p in prots}
 
-        if mar_prob < mar_param:
-            data.loc[i, 'Intensity'] = np.nan
-            data.loc[i, 'MAR'] = True
-        else:
-            data.loc[i, 'MAR'] = False
 
-        if mnar_prob < mnar_thresh:
-            data.loc[i, 'Intensity'] = np.nan
-            data.loc[i, 'MNAR'] = True
-        else:
-            data.loc[i, 'MNAR'] = False
+def apply_dropout(sim_df, a, b, group_col="Condition", offsets=None, rng=None):
+    """
+    Impose MNAR missingness on complete simulated data.
+ 
+    sim_df  : simulated runs x proteins, complete, plus grouping column
+    a, b    : detection curve from fit_mnar
+    offsets : optional per-protein intercept shifts from calibrate_offsets
+    """
+    rng = np.random.default_rng() if rng is None else rng
+    out = sim_df.copy()
+    prots = [c for c in out.columns if c != group_col]
+ 
+    X = out[prots].to_numpy(dtype=float)
+    shift = np.zeros(len(prots))
+    if offsets is not None:
+        shift = np.array([offsets.get(p, 0.0) for p in prots], dtype=float)
+ 
+    p_miss = 1.0 - expit(a + shift[None, :] + b * X)
+    X[rng.random(X.shape) < p_miss] = np.nan
+    out[prots] = X
+    return out
 
-    return data
-
-# def plot_indra(tsv_file, output_file=None, figsize=(10, 8)):
-#     """
-#     Plot a network graph from INDRA relationship data showing increase/decrease relationships.
-#
-#     Parameters:
-#     -----------
-#     tsv_file : str or pandas.DataFrame
-#         Path to the TSV file containing INDRA relationships or a pandas DataFrame
-#     output_file : str, optional
-#         Path to save the output figure. If None, the figure is displayed
-#     figsize : tuple, optional
-#         Size of the figure (width, height) in inches
-#
-#     Returns:
-#     --------
-#     G : networkx.DiGraph
-#         The created graph object
-#     """
-#     import pandas as pd
-#     import networkx as nx
-#     import matplotlib.pyplot as plt
-#     import matplotlib.patches as mpatches
-#
-#     # Read the TSV file if string is provided
-#     if isinstance(tsv_file, str):
-#         df = pd.read_csv(tsv_file, sep='\t')
-#     else:
-#         df = tsv_file
-#
-#     # Create directed graph
-#     G = nx.DiGraph()
-#
-#     # Define colors for the two relationship types
-#     colors = {
-#         'IncreaseAmount': 'green',
-#         'DecreaseAmount': 'red'
-#     }
-#
-#     # Add nodes and edges
-#     for _, row in df.iterrows():
-#         source = row['source_hgnc_symbol']
-#         target = row['target_hgnc_symbol']
-#         relation = row['relation']
-#
-#         # Skip if not an increase or decrease relation
-#         if relation not in colors:
-#             continue
-#
-#         # Add nodes
-#         G.add_node(source)
-#         G.add_node(target)
-#
-#         # Add edge with color based on relation
-#         G.add_edge(source, target, relation=relation, color=colors[relation])
-#
-#     # Create plot
-#     plt.figure(figsize=figsize)
-#
-#     # Position nodes using spring layout
-#     pos = nx.spring_layout(G, seed=42)
-#
-#     # Draw nodes
-#     nx.draw_networkx_nodes(G, pos, node_color='lightblue', node_size=500, alpha=0.8)
-#
-#     # Draw node labels
-#     nx.draw_networkx_labels(G, pos, font_size=10, font_weight='bold')
-#
-#     # Draw edges with colors based on relationship type
-#     edge_colors = [G[u][v]['color'] for u, v in G.edges()]
-#     nx.draw_networkx_edges(G, pos, width=2, edge_color=edge_colors,
-#                            arrowsize=20, connectionstyle='arc3,rad=0.1')
-#
-#     # Add legend
-#     legend_items = [
-#         mpatches.Patch(color='green', label='Increase Amount'),
-#         mpatches.Patch(color='red', label='Decrease Amount')
-#     ]
-#     plt.legend(handles=legend_items, loc='upper right')
-#
-#     # Remove axis
-#     plt.axis('off')
-#     plt.title("INDRA Gene Regulatory Network")
-#
-#     # Save or display
-#     if output_file:
-#         plt.savefig(output_file, bbox_inches='tight')
-#         print(f"Figure saved to {output_file}")
-#     else:
-#         plt.tight_layout()
-#         plt.show()
-#
-#     return G
+def mask_simulations_with_lod(sim_list, lod_series):
+    masked_list = []
+    for df in sim_list:
+        df_masked = df.copy()
+        # Only consider numeric protein columns that appear in lod
+        prot_cols = df_masked.select_dtypes(include=[np.number]).columns.intersection(lod_series.index)
+        if len(prot_cols) > 0:
+            mins = lod_series.loc[prot_cols]
+            # Broadcast series of mins across columns and mask values below LOD
+            df_masked.loc[:, prot_cols] = df_masked[prot_cols].where(df_masked[prot_cols].ge(mins), np.nan)
+        masked_list.append(df_masked)
+    return masked_list
