@@ -126,3 +126,14 @@ node_modules/
 npm-debug.log*
 
 # End of file
+
+# Backup of pre-reordering simulation results (large pickles)
+data/backup/
+
+# data/results: large files and all 4.2 sample-size results live on the lab server, not in git
+# (list with checksums: data/results/SERVER_FILES.md). stale_* folders are local backups only.
+data/results/**/stale_*/
+data/results/*/placement_*
+data/results/*/sample_size_*
+data/results/PDAC_MRM/power_curves_experiments.csv
+data/results/MEL/missingness_correlations.npz
